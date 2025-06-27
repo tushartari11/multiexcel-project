@@ -1,139 +1,10 @@
-import openpyxl
 from collections import defaultdict
-import json
+from excel_to_dictionary import excel_to_dictionary
+from export_dict_to_json_file import export_to_json
+from print_sheet_summary import print_sheet_summary
 import datetime
 import pg_dbconnect
-import re
 import logging
-
-def excel_to_dictionary(file_path):
-    """
-    Read multiple sheets from an Excel file and create dictionaries
-    using headers as keys and cell values as values for each row.
-    
-    Args:
-        file_path (str): Path to the Excel file
-    
-    Returns:
-        dict: Dictionary with sheet names as keys and list of row dictionaries as values
-    """
-    
-    # Open the Excel workbook
-    workbook = openpyxl.load_workbook(file_path, data_only=True)
-    
-    # Dictionary to store all sheets data
-    all_sheets_data = {}
-    
-    # Get all sheet names
-    sheet_names = workbook.sheetnames
-    print(f"Found {len(sheet_names)} sheets: {sheet_names}")
-    logging.debug('Found %s sheets %s:',len(sheet_names), sheet_names)
-    
-    # Iterate through each sheet
-    for sheet_name in sheet_names:
-        logging.info("Processing sheet: %s", {sheet_name})
-        
-        # Select the current sheet
-        worksheet = workbook[sheet_name]
-        
-        # Get the headers from the first row
-        headers = []
-        first_row = worksheet[1]  # First row (1-indexed)
-        
-        for cell in first_row:
-            # Normalize header names
-            normalized_header = normalize_headers(cell.value)
-            if normalized_header is not None:
-                headers.append(normalized_header.strip())
-            else:
-                headers.append(f"Column_{len(headers) + 1}")  # Default name for empty headers
-        
-        logging.info("Headers found: %s ", headers)
-        logging.info("Total number of columns in header:  %s", len(headers))
-        
-        # List to store dictionaries for each row
-        sheet_data = []
-        
-        # Iterate through rows starting from row 2 (skip header row)
-        for row_num, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
-            # Skip completely empty rows
-            if all(cell is None or str(cell).strip() == '' for cell in row):
-                continue
-            
-            # Create dictionary for current row
-            row_dict = {}
-            
-            # Iterate through each cell in the row
-            for col_index, cell_value in enumerate(row):
-                # Make sure we don't exceed the number of headers
-                if col_index < len(headers):
-                    header = headers[col_index]
-                    # Handle None values and convert to appropriate type
-                    if cell_value is None:
-                        row_dict[header] = ""
-                    else:
-                        row_dict[header] = cell_value
-            
-            # Add the row dictionary to sheet data
-            sheet_data.append(row_dict)
-           # print(f"Row {row_num}: {row_dict}")
-        
-        # Add sheet data to main dictionary
-        all_sheets_data[sheet_name] = sheet_data
-        logging.info('Sheet %s processed: %s rows', sheet_name, len(sheet_data))
-    
-    # Close the workbook
-    workbook.close()
-    
-    return all_sheets_data
-
-def normalize_headers(headerString):
-    # Replace sequences of space and/or hyphen with single underscore
-    if headerString is None:
-        return None
-    if not isinstance(headerString, str):
-        headerString = str(headerString)
-        logging.debug("In normalize_header : headerString:-  %s :: len:- %s", headerString, len(headerString))
-    return re.sub(r'[\s\-]+', '_', headerString.strip())
-
-def print_sheet_summary(data_dict):
-    """
-    Print a summary of the data structure
-    """
-    print("\n" + "="*50)
-    print("DATA SUMMARY")
-    print("="*50)
-    
-
-    for sheet_name, rows in data_dict.items():
-        print(f"\nSheet: {sheet_name}")
-        print(f"Number of rows: {len(rows)}")
-        
-        if rows:
-            print(f"Columns: {list(rows[0].keys())}")
-            print(f"Sample row: {rows[0]}")
-
-# exports the dictionary to a Json file
-def export_to_json(data_dict, output_file):
-    """
-    Export the data dictionary to a JSON file.
-    
-    Args:
-        data_dict (dict): The data dictionary to export.
-        output_file (str): The path to the output JSON file.
-    """
-    
-    def json_serializer(obj):
-        """JSON serializer for objects not serializable by default json code"""
-        if isinstance(obj, (datetime.datetime, datetime.date)):
-            return obj.isoformat()
-        elif isinstance(obj, datetime.time):
-            return obj.strftime('%H:%M:%S')
-        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-    
-    with open(output_file, 'w', encoding='utf-8') as json_file:
-        json.dump(data_dict, json_file, indent=4, ensure_ascii=False, default=json_serializer)
-    print(f"Data exported to {output_file}")
 
 # This method creates insert statements for each row in the dictionary
 def create_insert_statements(data_dict, table_name):
@@ -163,6 +34,7 @@ def create_insert_statements(data_dict, table_name):
 def insert_data_to_db(data_dict, table_name):
     """
     Insert data from the dictionary into a PostgreSQL database table.
+    Adds a source_sheet column to track which sheet the data came from.
     
     Args:
         data_dict (dict): The data dictionary containing sheet data.
@@ -186,13 +58,15 @@ def insert_data_to_db(data_dict, table_name):
         cleaned_data = clean_data_for_insert(data_dict)
         
         for sheet_name, rows in cleaned_data.items():
-            logging.info("Inserting data from sheet: %s (%s rows)", sheet_name, len(rows))
+            logging.info("Inserting data from sheet: %s (%s rows) into table: %s", sheet_name, len(rows), table_name)
             
             for row_num, row in enumerate(rows, 1):
                 total_rows += 1
                 try:
+                    # Add source_sheet column to track which sheet this data came from
+                    row['source_sheet'] = sheet_name
+                    
                     # Only include columns that have values (non-empty)
-                    # This allows database DEFAULT values to be used for omitted columns
                     if not row:  # Skip completely empty rows
                         logging.warning("Skipping empty row %s from sheet '%s'", row_num, sheet_name)
                         continue
@@ -205,7 +79,7 @@ def insert_data_to_db(data_dict, table_name):
                     cursor.execute(insert_statement, tuple(row.values()))
                     successful_inserts += 1
                     
-                    logging.debug("Row %s from sheet '%s' inserted successfully", row_num, sheet_name)
+                    logging.debug("Row %s from sheet '%s' inserted successfully into table '%s'", row_num, sheet_name, table_name)
                     
                 except Exception as row_error:
                     failed_inserts += 1
@@ -217,18 +91,18 @@ def insert_data_to_db(data_dict, table_name):
         
         # Commit all successful transactions
         conn.commit()
-        logging.info("Data insertion completed. Total: %s, Successful: %s, Failed: %s", 
-                    total_rows, successful_inserts, failed_inserts)
+        logging.info("Data insertion completed for table '%s'. Total: %s, Successful: %s, Failed: %s", 
+                    table_name, total_rows, successful_inserts, failed_inserts)
         
         if failed_inserts > 0:
-            logging.warning("Some rows failed to insert. Check the log for details.")
+            logging.warning("Some rows failed to insert in table '%s'. Check the log for details.", table_name)
             return False
         else:
-            logging.info("All rows inserted successfully!")
+            logging.info("All rows inserted successfully into table '%s'!", table_name)
             return True
             
     except Exception as e:
-        logging.error("Critical error during data insertion: %s", e)
+        logging.error("Critical error during data insertion to table '%s': %s", table_name, e)
         logging.error("Rolling back all transactions...")
         conn.rollback()
         return False
@@ -264,6 +138,7 @@ def create_table_statement(data_dict, table_name):
     # Analyze data types for each column
     columns = []
     columns.append("id SERIAL PRIMARY KEY")  # Add auto-increment primary key
+    columns.append("source_sheet TEXT DEFAULT ''")  # Add source sheet tracking
     
     for column_name, sample_value in first_row.items():
         # Clean column name for SQL compatibility
@@ -275,7 +150,7 @@ def create_table_statement(data_dict, table_name):
         elif isinstance(sample_value, bool):
             data_type = "BOOLEAN DEFAULT FALSE"
         elif isinstance(sample_value, int):
-            data_type = "INTEGER DEFAULT 0"
+            data_type = "BIGINT DEFAULT 0"
         elif isinstance(sample_value, float):
             data_type = "DECIMAL(10,2) DEFAULT 0.0"
         elif isinstance(sample_value, (datetime.datetime, datetime.date)):
@@ -398,7 +273,7 @@ def get_table_schema(data_dict):
         elif isinstance(sample_value, bool):
             data_type = "BOOLEAN"
         elif isinstance(sample_value, int):
-            data_type = "INTEGER"
+            data_type = "BIGINT"
         elif isinstance(sample_value, float):
             data_type = "DECIMAL"
         elif isinstance(sample_value, (datetime.datetime, datetime.date)):
@@ -467,7 +342,8 @@ def group_sheets_by_schema(all_data):
 
 def create_tables_for_schema_groups(schema_groups, base_table_name):
     """
-    Create separate tables for each schema group.
+    Create one table for each unique schema group.
+    All sheets with the same schema will share the same table.
     
     Args:
         schema_groups (dict): Dictionary of schema groups.
@@ -479,37 +355,35 @@ def create_tables_for_schema_groups(schema_groups, base_table_name):
     table_mapping = {}
     
     for group_index, (schema_key, group_info) in enumerate(schema_groups.items(), 1):
-        # Generate table name based on the sheets in this group
         sheets_in_group = group_info['sheets']
         
-        # Determine table name based on sheet years/patterns
-        if len(sheets_in_group) == 1:
-            table_name = f"{base_table_name}_{sheets_in_group[0]}"
-        else:
-            # Try to find a pattern (like year ranges)
-            years = []
-            for sheet in sheets_in_group:
-                if sheet.isdigit() and len(sheet) == 4:  # Year format
-                    years.append(int(sheet))
-            
-            if years:
-                years.sort()
-                if len(years) > 1:
-                    table_name = f"{base_table_name}_{min(years)}_to_{max(years)}"
-                else:
-                    table_name = f"{base_table_name}_{years[0]}"
+        # Create a descriptive table name based on the schema pattern
+        years = []
+        for sheet in sheets_in_group:
+            if sheet.isdigit() and len(sheet) == 4:  # Year format
+                years.append(int(sheet))
+        
+        if years:
+            years.sort()
+            # Name table based on year range or pattern
+            if len(years) > 2:
+                table_name = f"{base_table_name}_{min(years)}_{max(years)}"
+            elif len(years) == 2:
+                table_name = f"{base_table_name}_{min(years)}_{max(years)}"
             else:
-                table_name = f"{base_table_name}_group_{group_index}"
+                table_name = f"{base_table_name}_{years[0]}"
+        else:
+            table_name = f"{base_table_name}_schema_{group_index}"
         
-        logging.info("Schema Group %s: Sheets %s -> Table '%s'", group_index, sheets_in_group, table_name)
-        logging.info("Columns in this schema: %s", [col[0] for col in group_info['schema']])
+        logging.info("Creating table '%s' for sheets with same schema: %s", table_name, sheets_in_group)
+        logging.info("Schema columns: %s", [col[0] for col in group_info['schema']])
         
-        # Create table for this schema group
+        # Create ONE table for this schema group (all sheets will use this table)
         if create_table_in_db(group_info['sample_data'], table_name):
             table_mapping[schema_key] = table_name
-            logging.info("Table '%s' created successfully for sheets: %s", table_name, sheets_in_group)
+            logging.info("Table '%s' created successfully - will contain data from sheets: %s", table_name, sheets_in_group)
         else:
-            logging.error("Failed to create table '%s' for sheets: %s", table_name, sheets_in_group)
+            logging.error("Failed to create table '%s' for schema group with sheets: %s", table_name, sheets_in_group)
     
     return table_mapping
 
@@ -520,16 +394,15 @@ if __name__ == "__main__":
 
     # Replace with your Excel file path
     excel_file_path = "/Users/tushartari/tushar/study/courses/IraSkills/work/JCB_DATA_PUNE_CLEANED.xlsx"
-
     output_json_file = "/Users/tushartari/tushar/study/courses/IraSkills/work/JCB_DATA_PUNE_CLEANED.json"
     
     try:
         # Read the Excel file and convert to dictionary
         result = excel_to_dictionary(excel_file_path)
         
-        # Print summary
+        #Print summary
         #print_sheet_summary(result)
-        # Export to JSON file
+        #Export to JSON file
         #export_to_json(result, output_json_file)
         
         # Group sheets by schema structure
